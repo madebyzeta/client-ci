@@ -1,0 +1,145 @@
+################################################################################
+#
+#                               CLIENT-CI (reusable)
+#
+#                 (c) 2026 Zeta Studios. All Rights Reserved.
+#
+################################################################################
+#
+# .github/workflows/client-ci.yml
+#
+# Reusable CI gate for projects that consume @madebyzeta/zta-infrastructure
+# (zeta-page, and any future client project). Lives in its own small,
+# public repo -- not inside zta-infrastructure itself -- specifically so
+# repos outside the madebyzeta GitHub org can call it. GitHub does not
+# allow a private repo's reusable workflows to be called from a different
+# org/account under any access setting; client projects are expected to
+# live under each client's own GitHub account (see
+# engineering-wiki/publishing/client-project-repo-ownership.mdx), which
+# is outside madebyzeta, so the workflow has to live somewhere public to
+# actually be callable from there. This repo contains no proprietary
+# code -- just this one generic install/typecheck/lint/build gate.
+#
+# Consuming it from a client project's own workflow:
+#
+#   jobs:
+#     ci:
+#       uses: madebyzeta/client-ci/.github/workflows/client-ci.yml@v1
+#       with:
+#         run-tests: false   # flip to true once the project has a real test suite
+#       secrets:
+#         gh-packages-token: ${{ secrets.GH_PACKAGES_TOKEN }}
+#
+# Always pin to a tag (v1, v2, ...), never `@main`. Pointing at `@main`
+# means a change merged here silently changes CI behavior for every
+# client project the moment it merges, with no review on their side --
+# the exact same reasoning that already applies to the npm package
+# itself. See engineering-wiki/ci/client-ci-gate.mdx (in zta-infrastructure)
+# for the full design, the tagging convention, and how to add a new
+# consumer.
+#
+# Auth: `gh-packages-token` must be a narrowly-scoped PAT with ONLY the
+# read:packages scope (classic) or equivalent fine-grained access, created
+# specifically for this purpose -- never a broader-scoped admin/repo PAT.
+# This secret only needs to read packages, nothing else; a workflow-run
+# secret leak with a narrowly-scoped token is a contained incident, not
+# an org-wide one.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version to use."
+        type: string
+        default: "20.x"
+      pnpm-version:
+        description: "pnpm version to activate via corepack."
+        type: string
+        default: "9.7.1"
+      run-tests:
+        description: "Run `pnpm run test:ci` after the build. Leave false until the project has a real test suite -- a required step that always no-ops isn't a gate, it's noise."
+        type: boolean
+        default: false
+      working-directory:
+        description: "Directory containing package.json, relative to the repo root. Override only for a monorepo-style layout."
+        type: string
+        default: "."
+    secrets:
+      gh-packages-token:
+        description: "A read:packages-scoped PAT for installing @madebyzeta/zta-infrastructure from npm.pkg.github.com. Must not be a broader-scoped token -- see header comment."
+        required: true
+
+jobs:
+  ci:
+    name: Install, Typecheck, Lint, Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Enable pnpm ${{ inputs.pnpm-version }} via corepack
+        run: |
+          corepack enable
+          corepack prepare pnpm@${{ inputs.pnpm-version }} --activate
+
+      # GITHUB_TOKEN here is deliberately the job-level env var name the
+      # project's own .npmrc already expects (`_authToken=${GITHUB_TOKEN}`)
+      # -- NOT GitHub Actions' automatic, same-repo-scoped secrets.GITHUB_TOKEN.
+      # It's a plain string match on an env var name, not the same credential;
+      # don't "simplify" this to the automatic token later, it can't read a
+      # package published from a different repository.
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        env:
+          GITHUB_TOKEN: ${{ secrets.gh-packages-token }}
+
+      # Next.js auto-generates next-env.d.ts (the ambient module
+      # declarations that make `import x from "./y.svg"` typecheck) as a
+      # side effect of `next build`/`next dev`/`next lint` -- it's
+      # gitignored, so a genuinely fresh checkout (exactly what CI always
+      # is) never has it yet. Running `tsc --noEmit` before anything else
+      # has ever generated it fails with "Cannot find module" on every
+      # static asset import, even though the exact same command passes
+      # locally -- only because a local checkout already has a stale copy
+      # on disk from some earlier `next dev` run. Write the standard,
+      # Next-managed content directly rather than reordering Typecheck
+      # after Build just to dodge this -- Next overwrites it with the same
+      # content during the Build step anyway, so this never conflicts.
+      - name: Ensure next-env.d.ts exists (Next.js projects only)
+        run: |
+          if [ -f next.config.ts ] || [ -f next.config.js ] || [ -f next.config.mjs ]; then
+            if [ ! -f next-env.d.ts ]; then
+              printf '%s\n' \
+                '/// <reference types="next" />' \
+                '/// <reference types="next/image-types/global" />' \
+                '' \
+                '// NOTE: This file should not be edited' \
+                '// see https://nextjs.org/docs/app/api-reference/config/typescript for more information.' \
+                > next-env.d.ts
+            fi
+          fi
+
+      - name: Typecheck
+        run: pnpm exec tsc --noEmit
+
+      # Runs the consuming project's own "lint" script (not `next lint`
+      # directly), so a project that customizes it (e.g. adds a prettier
+      # --check) still gets its real lint behavior checked, not a fixed
+      # subset of it.
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Run tests
+        if: ${{ inputs.run-tests }}
+        run: pnpm run test:ci
